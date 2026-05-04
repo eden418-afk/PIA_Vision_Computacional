@@ -1,0 +1,673 @@
+import FreeCAD as App
+import Part
+import os
+import csv
+import json
+from math import radians
+import math
+
+
+# =====================================================
+# CAMBIA ESTA RUTA A LA CARPETA RAÍZ DE TU PROYECTO
+# =====================================================
+
+PROJECT_DIR = r"C:\Users\PDX\Documents\UANL\8vo semestre\Vision\PIA_Vision_Computacional"
+
+
+CAD_DIR = os.path.join(PROJECT_DIR, "cad", "modelos")
+RESULTADOS_DIR = os.path.join(PROJECT_DIR, "resultados")
+
+os.makedirs(CAD_DIR, exist_ok=True)
+os.makedirs(RESULTADOS_DIR, exist_ok=True)
+
+
+THICKNESS_MM = 3.0
+
+
+def make_wire_from_points(points):
+    """
+    Crea un wire cerrado a partir de puntos 2D.
+    """
+    vertices = [App.Vector(x, y, 0) for x, y in points]
+
+    if vertices[0] != vertices[-1]:
+        vertices.append(vertices[0])
+
+    edges = []
+
+    for i in range(len(vertices) - 1):
+        edge = Part.makeLine(vertices[i], vertices[i + 1])
+        edges.append(edge)
+
+    return Part.Wire(edges)
+
+
+def make_circle_wire(cx, cy, radius):
+    """
+    Crea un wire circular para usarlo como agujero.
+    """
+    circle = Part.makeCircle(radius, App.Vector(cx, cy, 0))
+    return Part.Wire([circle])
+
+
+def create_solid_from_profile(points, holes=None):
+    """
+    Crea una pieza sólida extruida desde un perfil 2D.
+    Los agujeros se generan restando cilindros mediante operación booleana.
+    """
+    if holes is None:
+        holes = []
+
+    # 1. Crear cara exterior
+    outer_wire = make_wire_from_points(points)
+    face = Part.Face(outer_wire)
+
+    # 2. Extruir la pieza
+    solid = face.extrude(App.Vector(0, 0, THICKNESS_MM))
+
+    # 3. Restar agujeros como cilindros
+    for hole in holes:
+        hx, hy, radius = hole
+
+        cylinder = Part.makeCylinder(
+            radius,
+            THICKNESS_MM + 2,
+            App.Vector(hx, hy, -1),
+            App.Vector(0, 0, 1)
+        )
+
+        solid = solid.cut(cylinder)
+
+    solid = solid.removeSplitter()
+
+    return solid
+
+
+def transform_shape(shape, angle_deg, tx, ty):
+    """
+    Rota y traslada la pieza.
+    """
+    transformed = shape.copy()
+    transformed.rotate(App.Vector(0, 0, 0), App.Vector(0, 0, 1), angle_deg)
+    transformed.translate(App.Vector(tx, ty, 0))
+
+    return transformed
+
+def get_center_of_mass(shape):
+    """
+    Obtiene el centro de masa de una geometría FreeCAD.
+
+    Si la geometría es un sólido, usa CenterOfMass directamente.
+    Si la geometría es un Compound, calcula el centroide ponderado
+    usando los sólidos internos.
+    """
+
+    # Caso 1: el objeto ya tiene CenterOfMass
+    if hasattr(shape, "CenterOfMass"):
+        return shape.CenterOfMass
+
+    # Caso 2: el objeto es un Compound con sólidos internos
+    solids = shape.Solids
+
+    if solids:
+        total_volume = 0.0
+        cx = 0.0
+        cy = 0.0
+        cz = 0.0
+
+        for solid in solids:
+            volume = solid.Volume
+            center = solid.CenterOfMass
+
+            total_volume += volume
+            cx += center.x * volume
+            cy += center.y * volume
+            cz += center.z * volume
+
+        if total_volume > 0:
+            return App.Vector(
+                cx / total_volume,
+                cy / total_volume,
+                cz / total_volume
+            )
+
+    # Caso 3: respaldo usando el centro del bounding box
+    bbox = shape.BoundBox
+    return App.Vector(
+        (bbox.XMin + bbox.XMax) / 2,
+        (bbox.YMin + bbox.YMax) / 2,
+        (bbox.ZMin + bbox.ZMax) / 2
+    )
+    
+    
+def add_centroid_marker(doc, center, radius=2.5):
+    """
+    Agrega una esfera roja en el centroide CAD.
+    """
+    sphere = Part.makeSphere(radius, center)
+
+    marker = doc.addObject("Part::Feature", "Centroide_CAD")
+    marker.Shape = sphere
+    marker.Label = "Centroide CAD"
+
+    marker.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+    marker.ViewObject.DisplayMode = "Shaded"
+
+    return marker
+    
+def add_angle_axis(doc, center, angle_deg, length=90):
+    """
+    Agrega una línea azul que representa la orientación angular CAD de la pieza.
+    El ángulo se interpreta en el plano XY, alrededor del eje Z.
+    """
+    import math
+
+    angle_rad = math.radians(angle_deg)
+
+    z_offset = 6.0
+
+    p1 = App.Vector(
+        center.x - length * math.cos(angle_rad),
+        center.y - length * math.sin(angle_rad),
+        center.z + z_offset
+    )
+
+    p2 = App.Vector(
+        center.x + length * math.cos(angle_rad),
+        center.y + length * math.sin(angle_rad),
+        center.z + z_offset
+    )
+
+    line = Part.makeLine(p1, p2)
+
+    axis_obj = doc.addObject("Part::Feature", "Eje_Angulo_CAD")
+    axis_obj.Shape = line
+    axis_obj.Label = f"Eje ángulo CAD {angle_deg}°"
+
+    axis_obj.ViewObject.LineColor = (0.0, 0.2, 1.0)
+    axis_obj.ViewObject.LineWidth = 5
+
+    return axis_obj
+    
+    
+def add_reference_axis(doc, center, length=90):
+    """
+    Agrega una línea verde horizontal como referencia de 0 grados.
+    """
+    z_offset = 5.0
+
+    p1 = App.Vector(center.x - length, center.y, center.z + z_offset)
+    p2 = App.Vector(center.x + length, center.y, center.z + z_offset)
+
+    line = Part.makeLine(p1, p2)
+
+    ref_obj = doc.addObject("Part::Feature", "Referencia_0_grados")
+    ref_obj.Shape = line
+    ref_obj.Label = "Referencia 0°"
+
+    ref_obj.ViewObject.LineColor = (0.0, 0.8, 0.0)
+    ref_obj.ViewObject.LineWidth = 3
+
+    return ref_obj
+    
+    
+
+def save_piece(spec, index):
+    """
+    Crea un documento CAD individual para una pieza.
+    """
+    filename = f"pieza_{index:02d}"
+    doc = App.newDocument(filename)
+
+    base_shape = create_solid_from_profile(
+        spec["points"],
+        spec.get("holes", [])
+    )
+
+    final_shape = transform_shape(
+        base_shape,
+        spec["angle_deg"],
+        spec["tx_mm"],
+        spec["ty_mm"]
+    )
+
+    obj = doc.addObject("Part::Feature", filename)
+    obj.Shape = final_shape
+    obj.Label = spec["name"]
+    
+    # Centroide / centro de masa calculado por CAD
+    center = get_center_of_mass(final_shape)
+    
+    # Marcadores visuales CAD
+    add_centroid_marker(doc, center)
+    add_reference_axis(doc, center)
+    add_angle_axis(doc, center, spec["angle_deg"])
+    
+    doc.recompute()
+    
+    model_path = os.path.join(CAD_DIR, f"{filename}.FCStd")
+    doc.saveAs(model_path)
+    
+    App.closeDocument(doc.Name)
+
+    return {
+        "imagen": f"{filename}.png",
+        "modelo_cad": f"{filename}.FCStd",
+        "figura": spec["name"],
+        "categoria_geometrica": spec.get("category", spec["name"]),
+        "num_agujeros_cad": len(spec.get("holes", [])),
+        "angulo_cad_grados": spec["angle_deg"],
+        "centroide_cad_mm_x": center.x,
+        "centroide_cad_mm_y": center.y,
+        "centroide_cad_mm_z": center.z,
+        "tx_mm": spec["tx_mm"],
+        "ty_mm": spec["ty_mm"],
+    }
+    
+    
+def regular_polygon_points(sides, radius, rotation_deg=0):
+    """
+    Genera puntos de un polígono regular centrado en el origen.
+    sides: número de lados
+    radius: radio exterior en mm
+    rotation_deg: rotación inicial del polígono
+    """
+    points = []
+
+    for i in range(sides):
+        angle = math.radians(rotation_deg + (360.0 * i / sides))
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append([x, y])
+
+    return points
+
+
+def circle_profile_points(radius, segments=96):
+    """
+    Genera una aproximación poligonal de un círculo.
+    Esto sirve porque tu create_solid_from_profile trabaja con points.
+    """
+    return regular_polygon_points(segments, radius, rotation_deg=0)
+
+
+def gear_profile_points(teeth=16, root_radius=42, outer_radius=55, rotation_deg=0):
+    """
+    Genera un perfil tipo engrane simple alternando radio raíz y radio exterior.
+    No es un engrane involuta real, pero visualmente funciona como engrane
+    para análisis de visión computacional.
+    """
+    points = []
+    total_points = teeth * 2
+
+    for i in range(total_points):
+        radius = outer_radius if i % 2 == 0 else root_radius
+        angle = math.radians(rotation_deg + (360.0 * i / total_points))
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append([x, y])
+
+    return points
+
+
+def rounded_link_profile(length=130, radius=26, segments=28):
+    """
+    Genera un brazo mecánico con extremos redondeados.
+    Es una cápsula 2D aproximada por puntos.
+    """
+    points = []
+
+    left_cx = -length / 2
+    right_cx = length / 2
+
+    # Semicírculo derecho
+    for i in range(segments + 1):
+        angle = math.radians(-90 + 180 * i / segments)
+        x = right_cx + radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append([x, y])
+
+    # Semicírculo izquierdo
+    for i in range(segments + 1):
+        angle = math.radians(90 + 180 * i / segments)
+        x = left_cx + radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append([x, y])
+
+    return points
+
+
+def star_profile_points(points_count=5, inner_radius=28, outer_radius=55, rotation_deg=90):
+    """
+    Genera una estrella o perfil dentado simple.
+    """
+    points = []
+    total_points = points_count * 2
+
+    for i in range(total_points):
+        radius = outer_radius if i % 2 == 0 else inner_radius
+        angle = math.radians(rotation_deg + (360.0 * i / total_points))
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append([x, y])
+
+    return points
+
+
+def get_piece_specs():
+    """
+    Define 20 perfiles variados en coordenadas locales de CAD.
+    Incluye figuras geométricas básicas y perfiles mecánicos.
+    Las unidades son milímetros.
+    """
+
+    return [
+        {
+            "name": "circulo_con_agujero_central",
+            "angle_deg": 0,
+            "tx_mm": 0,
+            "ty_mm": 0,
+            "points": circle_profile_points(48, segments=96),
+            "holes": [
+                [0, 0, 12]
+            ],
+        },
+        {
+            "name": "triangulo_mecanico",
+            "angle_deg": 18,
+            "tx_mm": -22,
+            "ty_mm": 12,
+            "points": regular_polygon_points(3, 58, rotation_deg=90),
+            "holes": [
+                [0, 0, 8]
+            ],
+        },
+        {
+            "name": "hexagono_perforado",
+            "angle_deg": 35,
+            "tx_mm": 18,
+            "ty_mm": -8,
+            "points": regular_polygon_points(6, 55, rotation_deg=30),
+            "holes": [
+                [0, 0, 10]
+            ],
+        },
+        {
+            "name": "octagono_brida",
+            "angle_deg": 52,
+            "tx_mm": -10,
+            "ty_mm": -12,
+            "points": regular_polygon_points(8, 60, rotation_deg=22.5),
+            "holes": [
+                [0, 0, 12],
+                [-28, -28, 5],
+                [28, -28, 5],
+                [-28, 28, 5],
+                [28, 28, 5],
+            ],
+        },
+        {
+            "name": "engrane_12_dientes",
+            "angle_deg": 70,
+            "tx_mm": 22,
+            "ty_mm": 8,
+            "points": gear_profile_points(teeth=12, root_radius=38, outer_radius=56),
+            "holes": [
+                [0, 0, 12]
+            ],
+        },
+        {
+            "name": "engrane_18_dientes",
+            "angle_deg": 88,
+            "tx_mm": -20,
+            "ty_mm": 0,
+            "points": gear_profile_points(teeth=18, root_radius=40, outer_radius=58),
+            "holes": [
+                [0, 0, 13],
+                [-24, 0, 5],
+                [24, 0, 5],
+                [0, -24, 5],
+                [0, 24, 5],
+            ],
+        },
+        {
+            "name": "estrella_dentada",
+            "angle_deg": 105,
+            "tx_mm": 10,
+            "ty_mm": 15,
+            "points": star_profile_points(points_count=6, inner_radius=28, outer_radius=58),
+            "holes": [
+                [0, 0, 9]
+            ],
+        },
+        {
+            "name": "brazo_mecanico_redondeado",
+            "angle_deg": 125,
+            "tx_mm": -12,
+            "ty_mm": 15,
+            "points": rounded_link_profile(length=130, radius=24, segments=32),
+            "holes": [
+                [-65, 0, 9],
+                [65, 0, 9]
+            ],
+        },
+        {
+            "name": "placa_ranurada_larga",
+            "angle_deg": 145,
+            "tx_mm": 0,
+            "ty_mm": -15,
+            "points": [
+                [-75, -22], [75, -22], [75, 22], [-75, 22]
+            ],
+            "holes": [
+                [-45, 0, 8],
+                [45, 0, 8]
+            ],
+        },
+        {
+            "name": "soporte_L_ancho",
+            "angle_deg": -15,
+            "tx_mm": 18,
+            "ty_mm": 5,
+            "points": [
+                [-62, -58], [-18, -58], [-18, -18],
+                [62, -18], [62, 38], [-62, 38]
+            ],
+            "holes": [
+                [-40, 18, 7],
+                [35, 18, 7]
+            ],
+        },
+        {
+            "name": "perfil_U_abierto",
+            "angle_deg": -32,
+            "tx_mm": 0,
+            "ty_mm": 12,
+            "points": [
+                [-72, -42], [72, -42], [72, -18],
+                [-36, -18], [-36, 18], [72, 18],
+                [72, 42], [-72, 42]
+            ],
+            "holes": [
+                [-52, 0, 7]
+            ],
+        },
+        {
+            "name": "placa_cruz",
+            "angle_deg": -48,
+            "tx_mm": -18,
+            "ty_mm": 5,
+            "points": [
+                [-24, -65], [24, -65], [24, -24],
+                [65, -24], [65, 24], [24, 24],
+                [24, 65], [-24, 65], [-24, 24],
+                [-65, 24], [-65, -24], [-24, -24]
+            ],
+            "holes": [
+                [0, 0, 9]
+            ],
+        },
+        {
+            "name": "base_irregular_tres_perforaciones",
+            "angle_deg": -62,
+            "tx_mm": 12,
+            "ty_mm": -12,
+            "points": [
+                [-72, -28], [-28, -28], [-12, -52],
+                [28, -52], [42, -28], [72, -28],
+                [72, 22], [45, 22], [28, 45],
+                [-28, 45], [-45, 22], [-72, 22]
+            ],
+            "holes": [
+                [0, -10, 8],
+                [-46, 0, 6],
+                [46, 0, 6]
+            ],
+        },
+        {
+            "name": "placa_trapezoidal",
+            "angle_deg": -80,
+            "tx_mm": -12,
+            "ty_mm": -12,
+            "points": [
+                [-72, -36], [58, -26], [76, 28], [-55, 38]
+            ],
+            "holes": [
+                [-35, 0, 7],
+                [34, 0, 7]
+            ],
+        },
+        {
+            "name": "perfil_muescado",
+            "angle_deg": -98,
+            "tx_mm": 25,
+            "ty_mm": 0,
+            "points": [
+                [-78, -32], [-28, -32], [-28, -10],
+                [8, -10], [8, -32], [78, -32],
+                [78, 32], [8, 32], [8, 10],
+                [-28, 10], [-28, 32], [-78, 32]
+            ],
+            "holes": [
+                [-54, 0, 7],
+                [54, 0, 7]
+            ],
+        },
+        {
+            "name": "rombo_perforado",
+            "angle_deg": -115,
+            "tx_mm": -25,
+            "ty_mm": 0,
+            "points": regular_polygon_points(4, 58, rotation_deg=45),
+            "holes": [
+                [0, 0, 10],
+                [-24, 0, 5],
+                [24, 0, 5]
+            ],
+        },
+        {
+            "name": "pentagono_mecanico",
+            "angle_deg": -130,
+            "tx_mm": 0,
+            "ty_mm": 18,
+            "points": regular_polygon_points(5, 58, rotation_deg=90),
+            "holes": [
+                [0, 0, 9]
+            ],
+        },
+        {
+            "name": "media_luna_tecnica",
+            "angle_deg": -145,
+            "tx_mm": 0,
+            "ty_mm": -18,
+            "points": [
+                [-65, -45], [-20, -58], [30, -50],
+                [68, -22], [58, 18], [30, 42],
+                [-5, 52], [-42, 38], [-70, 5]
+            ],
+            "holes": [
+                [20, 0, 12],
+                [-35, 0, 7]
+            ],
+        },
+        {
+            "name": "brida_rectangular_4_perforaciones",
+            "angle_deg": 160,
+            "tx_mm": 15,
+            "ty_mm": -10,
+            "points": [
+                [-68, -42], [68, -42], [68, 42], [-68, 42]
+            ],
+            "holes": [
+                [-42, -22, 6],
+                [42, -22, 6],
+                [-42, 22, 6],
+                [42, 22, 6],
+                [0, 0, 11],
+            ],
+        },
+        {
+            "name": "soporte_compuesto_irregular",
+            "angle_deg": 172,
+            "tx_mm": -15,
+            "ty_mm": 10,
+            "points": [
+                [-75, -42], [-25, -42], [-25, -18],
+                [18, -18], [18, -42], [75, -42],
+                [75, 42], [38, 42], [38, 16],
+                [-35, 16], [-35, 42], [-75, 42]
+            ],
+            "holes": [
+                [-52, -5, 6],
+                [52, -5, 6],
+                [0, 0, 8]
+            ],
+        },
+    ]
+
+
+def main():
+    specs = get_piece_specs()
+
+    csv_path = os.path.join(RESULTADOS_DIR, "cad_ground_truth.csv")
+    json_path = os.path.join(RESULTADOS_DIR, "cad_geometry.json")
+
+    rows = []
+
+    for index, spec in enumerate(specs, start=1):
+        row = save_piece(spec, index)
+        rows.append(row)
+        print(f"Generada pieza CAD {index:02d}: {row['modelo_cad']}")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+        fieldnames = [
+            "imagen",
+            "modelo_cad",
+            "figura",
+            "categoria_geometrica",
+            "num_agujeros_cad",
+            "angulo_cad_grados",
+            "centroide_cad_mm_x",
+            "centroide_cad_mm_y",
+            "centroide_cad_mm_z",
+            "tx_mm",
+            "ty_mm",
+        ]
+
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(row)
+
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(specs, json_file, indent=4)
+
+    print("")
+    print("Proceso terminado.")
+    print(f"Modelos CAD guardados en: {CAD_DIR}")
+    print(f"Referencia CAD guardada en: {csv_path}")
+    print(f"Geometría CAD guardada en: {json_path}")
+
+
+main()
